@@ -26,11 +26,26 @@ wheels/
 .installed.cfg
 *.egg
 
-# Model cache
+# Model cache and downloads
 .cache/
 models/
 *.bin
 *.onnx
+.transformers_cache/
+.huggingface/
+
+# Audio files (output and temporary)
+*_spanish.mp3
+*_translated.mp3
+*_output.mp3
+*.wav
+test_output.*
+
+# Text files (intermediate outputs)
+*.en.txt
+*.es.txt
+*_transcription.txt
+*_translation.txt
 
 # Temporary files
 *.tmp

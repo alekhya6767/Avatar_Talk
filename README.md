@@ -18,26 +18,40 @@ A local, fully FOSS pipeline that converts English audio to Spanish audio using 
 - ✅ Performance timing metrics
 - ✅ Multiple Whisper model sizes supported
 - ✅ GPU acceleration support (CUDA)
+- ✅ Modern Python packaging with `uv`
 
 ## Quick Start
 
-1. **Install dependencies:**
+1. **Install with uv (recommended):**
 ```bash
-python setup.py
+# Install uv if not already installed
+pip install uv
+
+# Install all dependencies automatically
+uv sync
 ```
 
-2. **Download Piper TTS:**
+2. **Or install manually:**
+```bash
+pip install -e .
+```
+
+3. **Download Piper TTS:**
    - Windows: Download from [Piper Releases](https://github.com/rhasspy/piper/releases)
    - Extract and add to PATH or note installation directory
 
-3. **Download Spanish voice model:**
+4. **Download Spanish voice model:**
    - Visit [Piper Voices](https://huggingface.co/rhasspy/piper-voices/tree/main/es)
    - Recommended: `es_ES-mms-female.onnx` or `es_MX-claude-high.onnx`
    - Download both `.onnx` and `.json` files
 
-4. **Run translation:**
+5. **Run translation:**
 ```bash
-python cli.py input_audio.wav output_audio.wav --voice-model path/to/spanish_voice.onnx
+# Using uv (recommended)
+uv run avatar-translator input_audio.wav output_audio.wav --voice-model path/to/spanish_voice.onnx
+
+# Or using installed package
+avatar-translator input_audio.wav output_audio.wav --voice-model path/to/spanish_voice.onnx
 ```
 
 ## Usage Examples
