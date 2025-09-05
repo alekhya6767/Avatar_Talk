@@ -1,0 +1,63 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Avatar Translator</title>
+    <link rel="stylesheet" href="popup.css" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+  </head>
+
+  <body>
+    <div class="app">
+      <header class="hero">
+        <div class="icon">🎙️</div>
+        <div>
+          <h1>Avatar Translator</h1>
+          <p>Audio Translation</p>
+        </div>
+      </header>
+
+      <section class="block">
+        <label class="label">🔊 Translate Audio To</label>
+        <select id="target-language" class="select">
+          <option value="es" selected>Spanish</option>
+          <option value="fr">French</option>
+          <option value="de">German</option>
+          <option value="hi">Hindi</option>
+          <option value="pt">Portuguese</option>
+          <option value="it">Italian</option>
+        </select>
+        <p class="hint">🎧 Source language will be auto-detected</p>
+      </section>
+
+      <section class="block">
+        <button id="continuous-capture" class="btn btn-primary">
+          Start Continuous Capture
+        </button>
+      </section>
+
+      <section class="panel">
+        <div id="capture-status" class="capture-status inactive">
+          <span class="status-indicator stopped"></span>
+          <span>Not recording</span>
+        </div>
+      </section>
+
+      <section class="panel small">
+        <div id="status-message" class="status"></div>
+      </section>
+
+      <!-- Optional: live transcript/translation -->
+      <section class="panel small">
+        <div id="transcript" class="transcript"></div>
+      </section>
+
+      <footer class="footer">
+        <span>v1.0.0</span>
+        <span>Powered by Avatar Translator</span>
+      </footer>
+    </div>
+
+    <script src="popup.js"></script>
+  </body>
+</html>

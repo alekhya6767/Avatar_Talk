@@ -60,3 +60,35 @@ test_output.*
 # OS
 .DS_Store
 Thumbs.db
+
+# Env files (file, not just folder)
+.env
+.env.*
+*.env
+
+# Tests & coverage
+.pytest_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+.pytype/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Node/Frontend (if you add tooling later)
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Chrome extension build artifacts
+chrome-extension/*.zip
+chrome-extension/*.crx
+chrome-extension/*.pem   # private key from packing
+
