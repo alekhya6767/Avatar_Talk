@@ -1,8 +1,9 @@
 """
 Machine Translation module with MarianMT (primary) and Argos Translate (fallback).
+Now supports dynamic target languages with model caching.
 """
 import logging
-from typing import Optional
+from typing import Optional, Dict, Tuple
 import torch
 from transformers import MarianMTModel, MarianTokenizer
 import argostranslate.package
@@ -10,188 +11,104 @@ import argostranslate.translate
 
 
 class MTModule:
-    """Machine Translation module with MarianMT primary and Argos fallback."""
-    
+    """MT with MarianMT primary + Argos fallback, dynamic per-target caching."""
+
     def __init__(self, source_lang: str = "en", target_lang: str = "es"):
-        """
-        Initialize the MT module.
-        
-        Args:
-            source_lang: Source language code (default: "en")
-            target_lang: Target language code (default: "es")
-        """
         self.logger = logging.getLogger(__name__)
         self.source_lang = source_lang
         self.target_lang = target_lang
-        
-        # MarianMT components
-        self.marian_model = None
-        self.marian_tokenizer = None
-        self.marian_model_name = f"Helsinki-NLP/opus-mt-{source_lang}-{target_lang}"
-        
-        # Argos components
-        self.argos_available = False
-        self._setup_argos()
-        
-    def _setup_argos(self) -> None:
-        """Setup Argos Translate as fallback."""
+
+        # Marian cache: (src, tgt) -> (tokenizer, model)
+        self._marian_cache: Dict[Tuple[str, str], Tuple[MarianTokenizer, MarianMTModel]] = {}
+
+        # Track which Argos packages we've tried to configure
+        self._argos_ready_pairs: Dict[Tuple[str, str], bool] = {}
+
+    # ---------- Marian ----------
+    def _marian_model_name(self, src: str, tgt: str) -> str:
+        # Helsinki naming is usually opus-mt-en-xx for these languages
+        return f"Helsinki-NLP/opus-mt-{src}-{tgt}"
+
+    def _ensure_marian(self, src: str, tgt: str) -> Tuple[MarianTokenizer, MarianMTModel]:
+        key = (src, tgt)
+        if key in self._marian_cache:
+            return self._marian_cache[key]
+
+        model_name = self._marian_model_name(src, tgt)
+        self.logger.info(f"Loading MarianMT model: {model_name}")
+        tok = MarianTokenizer.from_pretrained(model_name)
+        model = MarianMTModel.from_pretrained(model_name)
+        if torch.cuda.is_available():
+            model = model.cuda()
+            self.logger.info("MarianMT model moved to GPU")
+        self._marian_cache[key] = (tok, model)
+        return tok, model
+
+    def translate_with_marian(self, text: str, src: str, tgt: str) -> str:
+        tok, model = self._ensure_marian(src, tgt)
+        inputs = tok(text, return_tensors="pt", padding=True, truncation=True, max_length=512)
+        if next(model.parameters()).is_cuda:
+            inputs = {k: v.cuda() for k, v in inputs.items()}
+        with torch.no_grad():
+            out = model.generate(**inputs, max_length=512, num_beams=4)
+        return tok.decode(out[0], skip_special_tokens=True)
+
+    # ---------- Argos ----------
+    def _setup_argos_pair(self, src: str, tgt: str) -> bool:
+        key = (src, tgt)
+        if key in self._argos_ready_pairs:
+            return self._argos_ready_pairs[key]
         try:
-            # Update package index
             argostranslate.package.update_package_index()
-            
-            # Check if the language pair is available
-            available_packages = argostranslate.package.get_available_packages()
-            package_to_install = None
-            
-            for package in available_packages:
-                if (package.from_code == self.source_lang and 
-                    package.to_code == self.target_lang):
-                    package_to_install = package
-                    break
-            
-            if package_to_install:
-                # Check if already installed
-                installed_packages = argostranslate.package.get_installed_packages()
-                already_installed = any(
-                    pkg.from_code == self.source_lang and pkg.to_code == self.target_lang
-                    for pkg in installed_packages
-                )
-                
-                if not already_installed:
-                    self.logger.info(f"Installing Argos package: {self.source_lang}-{self.target_lang}")
-                    argostranslate.package.install_from_path(package_to_install.download())
-                
-                self.argos_available = True
-                self.logger.info("Argos Translate fallback configured successfully")
+            available = argostranslate.package.get_available_packages()
+            pkg = next((p for p in available if p.from_code == src and p.to_code == tgt), None)
+            if pkg:
+                installed = argostranslate.package.get_installed_packages()
+                if not any(p.from_code == src and p.to_code == tgt for p in installed):
+                    self.logger.info(f"Installing Argos package: {src}-{tgt}")
+                    argostranslate.package.install_from_path(pkg.download())
+                self._argos_ready_pairs[key] = True
             else:
-                self.logger.warning(f"Argos package not available for {self.source_lang}-{self.target_lang}")
-                
+                self.logger.warning(f"Argos package not available for {src}-{tgt}")
+                self._argos_ready_pairs[key] = False
         except Exception as e:
-            self.logger.warning(f"Failed to setup Argos Translate: {e}")
-            self.argos_available = False
-    
-    def load_marian_model(self) -> None:
-        """Load MarianMT model and tokenizer."""
-        try:
-            self.logger.info(f"Loading MarianMT model: {self.marian_model_name}")
-            
-            self.marian_tokenizer = MarianTokenizer.from_pretrained(self.marian_model_name)
-            self.marian_model = MarianMTModel.from_pretrained(self.marian_model_name)
-            
-            # Move to GPU if available
-            if torch.cuda.is_available():
-                self.marian_model = self.marian_model.cuda()
-                self.logger.info("MarianMT model moved to GPU")
-            
-            self.logger.info("MarianMT model loaded successfully")
-            
-        except Exception as e:
-            self.logger.error(f"Failed to load MarianMT model: {e}")
-            raise
-    
-    def translate_with_marian(self, text: str) -> str:
-        """
-        Translate text using MarianMT.
-        
-        Args:
-            text: Text to translate
-            
-        Returns:
-            Translated text
-        """
-        if self.marian_model is None or self.marian_tokenizer is None:
-            self.load_marian_model()
-        
-        try:
-            # Tokenize input
-            inputs = self.marian_tokenizer(text, return_tensors="pt", padding=True, truncation=True)
-            
-            # Move to GPU if model is on GPU
-            if next(self.marian_model.parameters()).is_cuda:
-                inputs = {k: v.cuda() for k, v in inputs.items()}
-            
-            # Generate translation
-            with torch.no_grad():
-                outputs = self.marian_model.generate(**inputs, max_length=512, num_beams=4)
-            
-            # Decode output
-            translated = self.marian_tokenizer.decode(outputs[0], skip_special_tokens=True)
-            
-            self.logger.debug(f"MarianMT translation: '{text}' -> '{translated}'")
-            return translated
-            
-        except Exception as e:
-            self.logger.error(f"MarianMT translation failed: {e}")
-            raise
-    
-    def translate_with_argos(self, text: str) -> str:
-        """
-        Translate text using Argos Translate.
-        
-        Args:
-            text: Text to translate
-            
-        Returns:
-            Translated text
-        """
-        if not self.argos_available:
-            raise RuntimeError("Argos Translate is not available")
-        
-        try:
-            translated = argostranslate.translate.translate(
-                text, self.source_lang, self.target_lang
-            )
-            
-            self.logger.debug(f"Argos translation: '{text}' -> '{translated}'")
-            return translated
-            
-        except Exception as e:
-            self.logger.error(f"Argos translation failed: {e}")
-            raise
-    
-    def translate(self, text: str, use_fallback: bool = True) -> str:
-        """
-        Translate text using MarianMT with optional Argos fallback.
-        
-        Args:
-            text: Text to translate
-            use_fallback: Whether to use Argos as fallback if MarianMT fails
-            
-        Returns:
-            Translated text
-        """
+            self.logger.warning(f"Failed Argos setup for {src}-{tgt}: {e}")
+            self._argos_ready_pairs[key] = False
+        return self._argos_ready_pairs[key]
+
+    def translate_with_argos(self, text: str, src: str, tgt: str) -> str:
+        return argostranslate.translate.translate(text, src, tgt)
+
+    # ---------- Public API ----------
+    def translate(self, text: str, target_lang: Optional[str] = None, use_fallback: bool = True) -> str:
+        """Translate text from current source_lang to target_lang (dynamic)."""
         if not text.strip():
             return text
-        
-        # Try MarianMT first
+        tgt = (target_lang or self.target_lang or "es").lower()
+        src = (self.source_lang or "en").lower()
+
+        # Try Marian first
         try:
-            self.logger.info("Attempting translation with MarianMT")
-            return self.translate_with_marian(text)
-            
+            self.logger.info(f"MT: Marian en->{tgt}")
+            return self.translate_with_marian(text, src, tgt)
         except Exception as e:
-            self.logger.warning(f"MarianMT failed: {e}")
-            
-            if use_fallback and self.argos_available:
-                self.logger.info("Falling back to Argos Translate")
+            self.logger.warning(f"MarianMT failed for {src}-{tgt}: {e}")
+
+            if use_fallback and self._setup_argos_pair(src, tgt):
                 try:
-                    return self.translate_with_argos(text)
-                except Exception as fallback_e:
-                    self.logger.error(f"Argos fallback also failed: {fallback_e}")
-                    raise RuntimeError(f"Both translation methods failed. MarianMT: {e}, Argos: {fallback_e}")
+                    self.logger.info("Falling back to Argos Translate")
+                    return self.translate_with_argos(text, src, tgt)
+                except Exception as e2:
+                    self.logger.error(f"Argos fallback failed: {e2}")
+                    raise RuntimeError(f"Both Marian and Argos failed for {src}-{tgt}")
             else:
-                if not use_fallback:
-                    self.logger.error("Fallback disabled, translation failed")
-                else:
-                    self.logger.error("No fallback available, translation failed")
-                raise
-    
+                raise RuntimeError(f"No MT available for {src}-{tgt}")
+
     def get_status(self) -> dict:
-        """Get status of translation components."""
         return {
-            "marian_loaded": self.marian_model is not None,
-            "marian_model_name": self.marian_model_name,
-            "argos_available": self.argos_available,
             "source_lang": self.source_lang,
             "target_lang": self.target_lang,
-            "cuda_available": torch.cuda.is_available()
+            "marian_cached_pairs": [f"{s}-{t}" for (s, t) in self._marian_cache.keys()],
+            "cuda_available": torch.cuda.is_available(),
+            "argos_ready_pairs": [f"{s}-{t}" for (s, t), ok in self._argos_ready_pairs.items() if ok],
         }

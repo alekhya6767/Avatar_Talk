@@ -1,5 +1,5 @@
-// offscreen.js — Capture tab audio as PCM and send WAV chunks to the SW.
-// Also plays back the returned TTS (base64 MP3) sent from the SW.
+// offscreen.js — capture tab audio -> WAV chunks, play TTS
+// This script runs in the offscreen document (offscreen.html).
 
 let stream = null;
 let ctx = null;
@@ -8,12 +8,14 @@ let processor = null;
 let zeroGain = null;
 
 let seq = 0;
-let sampleRate = 48000;          // will be overridden by AudioContext
+let sampleRate = 48000;
 let chunkMs = 5000;
-let maxMs = 300000;              // safety stop
-let stopTimer = null;
+let maxMs = 300000;
+let flushTimer = null;
 
-// Simple, robust ArrayBuffer -> base64 (chunked)
+let ttsAudio = null;   // single player we can stop immediately
+
+// -------------- utils --------------
 function abToBase64(ab) {
   const bytes = new Uint8Array(ab);
   let binary = "";
@@ -24,51 +26,42 @@ function abToBase64(ab) {
   return btoa(binary);
 }
 
-// Encode Float32 samples -> 16-bit PCM WAV (mono)
 function encodeWAV(samples, sr) {
   const dataLen = samples.length * 2;
   const buffer = new ArrayBuffer(44 + dataLen);
   const view = new DataView(buffer);
 
-  // RIFF header
   writeString(view, 0, "RIFF");
   view.setUint32(4, 36 + dataLen, true);
   writeString(view, 8, "WAVE");
 
-  // fmt  chunk
   writeString(view, 12, "fmt ");
-  view.setUint32(16, 16, true);     // PCM fmt chunk size
-  view.setUint16(20, 1, true);      // audio format: 1 = PCM
-  view.setUint16(22, 1, true);      // channels: 1 (mono)
-  view.setUint32(24, sr, true);     // sample rate
-  view.setUint32(28, sr * 2, true); // byte rate = sr * blockAlign
-  view.setUint16(32, 2, true);      // blockAlign = channels * 2 bytes
-  view.setUint16(34, 16, true);     // bits per sample
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);  // PCM
+  view.setUint16(22, 1, true);  // mono
+  view.setUint32(24, sr, true);
+  view.setUint32(28, sr * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
 
-  // data chunk
   writeString(view, 36, "data");
   view.setUint32(40, dataLen, true);
-
-  // PCM samples
-  floatTo16BitPCM(view, 44, samples);
+  floatTo16PCM(view, 44, samples);
   return buffer;
 
-  function writeString(dataview, offset, str) {
-    for (let i = 0; i < str.length; i++) dataview.setUint8(offset + i, str.charCodeAt(i));
-  }
-  function floatTo16BitPCM(dataview, offset, input) {
-    let pos = offset;
+  function writeString(dv, off, s) { for (let i = 0; i < s.length; i++) dv.setUint8(off + i, s.charCodeAt(i)); }
+  function floatTo16PCM(dv, off, input) {
+    let pos = off;
     for (let i = 0; i < input.length; i++, pos += 2) {
-      let s = Math.max(-1, Math.min(1, input[i]));
-      dataview.setInt16(pos, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+      let v = Math.max(-1, Math.min(1, input[i]));
+      dv.setInt16(pos, v < 0 ? v * 0x8000 : v * 0x7FFF, true);
     }
   }
 }
 
-// A very small ring buffer to accumulate audio between flushes
+// Simple ring to accumulate input
 const ring = {
-  chunks: [],
-  length: 0,
+  chunks: [], length: 0,
   push(f32) { this.chunks.push(f32); this.length += f32.length; },
   take(n) {
     n = Math.min(n, this.length);
@@ -88,71 +81,89 @@ const ring = {
   clear() { this.chunks = []; this.length = 0; }
 };
 
+// Announce readiness so the service worker can sync up.
+try { chrome.runtime.sendMessage({ type: "OFFSCREEN_READY" }); } catch {}
+
+// Accept a ping to re-announce (used after service worker restarts)
+chrome.runtime.onMessage.addListener((msg) => {
+  if (msg && msg.type === "PING_OFFSCREEN") {
+    try { chrome.runtime.sendMessage({ type: "OFFSCREEN_READY" }); } catch {}
+  }
+});
+
+// ---------- main control ----------
 chrome.runtime.onMessage.addListener(async (msg) => {
+  if (!msg || !msg.type) return;
+
   if (msg.type === "OFFSCREEN_START") {
     const { streamId, timeslice = 5000, maxMs: mm = 300000 } = msg.payload || {};
     chunkMs = timeslice;
     maxMs = mm;
 
     try {
-      // Bind to tab stream
+      // Bind to the tab audio stream
       stream = await navigator.mediaDevices.getUserMedia({
         audio: { mandatory: { chromeMediaSource: "tab", chromeMediaSourceId: streamId } },
-        video: false
+        video: false,
       });
 
       ctx = new (window.AudioContext || window.webkitAudioContext)();
       sampleRate = ctx.sampleRate;
 
-      source = ctx.createMediaStreamSource(stream);
+      const sourceNode = ctx.createMediaStreamSource(stream);
+      source = sourceNode;
 
-      // ScriptProcessor is deprecated but works across Chrome/Offscreen.
+      // ScriptProcessor is deprecated but works reliably in offscreen contexts.
       const BUFFER_SIZE = 4096;
       processor = ctx.createScriptProcessor(BUFFER_SIZE, 1, 1);
       processor.onaudioprocess = (e) => {
-        const input = e.inputBuffer.getChannelData(0);
         // Copy to avoid retaining the large backing store
-        ring.push(new Float32Array(input));
+        ring.push(new Float32Array(e.inputBuffer.getChannelData(0)));
       };
 
-      // Keep node chain "alive" without audible output
+      // Keep the graph alive without producing audible output
       zeroGain = ctx.createGain();
       zeroGain.gain.value = 0;
-
       source.connect(processor);
       processor.connect(zeroGain);
       zeroGain.connect(ctx.destination);
-
       await ctx.resume();
 
-      // Periodically flush to WAV
+      // Periodically flush ring -> WAV
       const flush = async () => {
         const samplesPerChunk = Math.floor(sampleRate * (chunkMs / 1000));
         const samples = ring.take(samplesPerChunk);
         if (samples.length > 0) {
           const wavBuf = encodeWAV(samples, sampleRate);
           const b64 = abToBase64(wavBuf);
-          chrome.runtime.sendMessage({
-            type: "OFFSCREEN_CHUNK",
-            payload: { b64, mimeType: "audio/wav", durationMs: chunkMs, seq: ++seq }
-          });
+          try {
+            await chrome.runtime.sendMessage({
+              type: "OFFSCREEN_CHUNK",
+              payload: { b64, mimeType: "audio/wav", durationMs: chunkMs, seq: ++seq },
+            });
+          } catch { /* bg might be sleeping; ignore */ }
         }
       };
+      flush(); // first one after ~chunkMs
+      flushTimer = setInterval(flush, chunkMs);
 
-      // First flush happens after chunkMs; then at a fixed interval
-      flush();
-      stopTimer = setInterval(flush, chunkMs);
+      // Safety timeout to auto-stop capture if left running
+      setTimeout(() => {
+        try { chrome.runtime.sendMessage({ type: "OFFSCREEN_ENDED" }); } catch {}
+      }, maxMs);
 
-      // Safety timeout to auto-stop (optional)
-      setTimeout(() => chrome.runtime.sendMessage({ type: "OFFSCREEN_ENDED" }), maxMs);
+      // Tell background we've started so it can mark state
+      try { chrome.runtime.sendMessage({ type: "OFFSCREEN_STARTED" }); } catch {}
     } catch (err) {
       console.error("OFFSCREEN_START failed:", err?.name, err?.message, err);
-      chrome.runtime.sendMessage({ type: "OFFSCREEN_ENDED" });
+      try { chrome.runtime.sendMessage({ type: "OFFSCREEN_ENDED" }); } catch {}
     }
+    return;
   }
 
   if (msg.type === "OFFSCREEN_STOP") {
-    try { clearInterval(stopTimer); } catch {}
+    // Stop timers and audio graph
+    try { clearInterval(flushTimer); } catch {}
     try { processor?.disconnect(); } catch {}
     try { zeroGain?.disconnect(); } catch {}
     try { source?.disconnect(); } catch {}
@@ -160,17 +171,34 @@ chrome.runtime.onMessage.addListener(async (msg) => {
     try { ctx?.close(); } catch {}
     stream = ctx = source = processor = zeroGain = null;
     ring.clear();
-    chrome.runtime.sendMessage({ type: "OFFSCREEN_ENDED" });
+
+    // Stop any TTS currently playing
+    try {
+      if (ttsAudio) {
+        ttsAudio.pause();
+        ttsAudio.src = "";
+      }
+    } catch {}
+
+    try { chrome.runtime.sendMessage({ type: "OFFSCREEN_ENDED" }); } catch {}
+    return;
   }
 
-  // Play back translated audio returned by SW
   if (msg.type === "OFFSCREEN_PLAY_TTS") {
     try {
       const { b64, mimeType = "audio/mp3" } = msg.payload || {};
-      const a = new Audio(`data:${mimeType};base64,${b64}`);
-      a.play().catch(() => {});
+      // Stop any previous clip immediately to avoid overlap tails.
+      if (!ttsAudio) ttsAudio = new Audio();
+      try {
+        ttsAudio.pause();
+        ttsAudio.currentTime = 0;
+      } catch {}
+      ttsAudio.src = `data:${mimeType};base64,${b64}`;
+      // Play without blocking; ignore user gesture restrictions in offscreen.
+      ttsAudio.play().catch(() => {});
     } catch (e) {
       console.warn("Play TTS failed:", e.message);
     }
+    return;
   }
 });
